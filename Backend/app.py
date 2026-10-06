@@ -174,45 +174,76 @@ def generate_description(place, answer_type, language):
     raise RuntimeError("Failed to generate description from Gemini.")
 
 
-def generate_speech(text, voice_id, locale):
-    # Check if Murf key is missing or still masked with asterisks
-    if not MURF_API_KEY or MURF_API_KEY.startswith("*") or "YOUR_" in MURF_API_KEY:
-        print("[Murf] Notice: MURF_API_KEY is not set or contains asterisks/placeholders in .env. Skipping Murf API call.")
-        return None, "Murf API key is missing or masked. Update MURF_API_KEY in .env with your unmasked key."
+def generate_speech(text, voice_id="Matthew", locale="en-US"):
+    murf_api_key = os.getenv("MURF_API_KEY", "").strip()
+
+    # Check if Murf key exists and is non-empty
+    if not murf_api_key:
+        print("[Murf] Configured: False (MURF_API_KEY is not set or empty in environment)")
+        return "", "Murf API key is not configured in Render environment variables."
+
+    print("[Murf] Configured: True")
+    print("[Murf] Request started")
+
+    clean_text = (text or "").strip()
+    if not clean_text:
+        print("[Murf] Warning: Empty text provided. Skipping audio generation.")
+        return "", "No text provided for audio generation."
 
     url = "https://global.api.murf.ai/v1/speech/stream"
     headers = {
-        "api-key": MURF_API_KEY,
+        "api-key": murf_api_key,
         "Content-Type": "application/json"
     }
-    data = {
-        "voice_id": voice_id,
-        "text": text,
-        "locale": locale,
-        "model": "FALCON",
+
+    v_id = voice_id or "Matthew"
+    loc = locale or "en-US"
+
+    payload = {
+        "text": clean_text,
+        "voiceId": v_id,
+        "voice_id": v_id,
+        "locale": loc,
+        "model": "falcon-2",
         "format": "MP3",
         "sampleRate": 24000,
         "channelType": "MONO"
     }
 
-    temp_path = None
     try:
-        response = requests.post(url, headers=headers, json=data, timeout=30)
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        print(f"[Murf] Response status: {response.status_code}")
+        print(f"[Murf] Response content type: {response.headers.get('Content-Type', 'unknown')}")
+
+        # If falcon-2 returns 400 with model message, fallback to FALCON
+        if response.status_code == 400 and "model" in response.text.lower():
+            print("[Murf] 'falcon-2' model rejected. Retrying with 'FALCON'...")
+            payload["model"] = "FALCON"
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            print(f"[Murf] Fallback response status: {response.status_code}")
+
         if response.status_code == 200:
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_audio:
-                temp_path = temp_audio.name
-                for chunk in response.iter_content(chunk_size=1024):
-                    if chunk:
-                        temp_audio.write(chunk)
-            print(f"[Murf] Speech generated successfully for voice '{voice_id}' ({locale}).")
-            return temp_path, None
+            audio_bytes = response.content
+            if audio_bytes and len(audio_bytes) > 50:
+                encoded_audio = base64.b64encode(audio_bytes).decode("utf-8")
+                print(f"[Murf] Audio generated successfully ({len(audio_bytes)} bytes).")
+                return encoded_audio, None
+            else:
+                print("[Murf Error] Response was status 200 but audio payload was empty.")
+                return "", "Murf returned empty audio data."
         else:
-            err_msg = f"Murf API responded with status {response.status_code}: {response.text}"
-            print(f"[Murf Error] {err_msg}")
-            return None, err_msg
+            safe_err = response.text[:200].replace(murf_api_key, "[REDACTED]")
+            print(f"[Murf Error] API error status: {response.status_code}")
+            print(f"[Murf Error] Safe response: {safe_err}")
+            return "", f"Murf audio is temporarily unavailable (Status {response.status_code})."
+
+    except requests.exceptions.Timeout:
+        print("[Murf Error] Request timed out after 30 seconds.")
+        return "", "Murf audio request timed out."
     except Exception as e:
-        print(f"[Murf Error] Request failed: {e}")
-        return None, str(e)
+        safe_exc = str(e).replace(murf_api_key, "[REDACTED]")
+        print(f"[Murf Error] Request exception: {safe_exc}")
+        return "", "Murf audio is temporarily unavailable."
 
 
 @app.route("/", methods=["GET"])
@@ -236,10 +267,12 @@ def favicon():
 def health_check():
     if request.method == "OPTIONS":
         return ("", 204)
+    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+    murf_key = os.getenv("MURF_API_KEY", "").strip()
     return jsonify({
         "status": "ok",
-        "gemini_configured": bool(GEMINI_API_KEY),
-        "murf_configured": bool(MURF_API_KEY and not MURF_API_KEY.startswith("*"))
+        "gemini_configured": bool(gemini_key),
+        "murf_configured": bool(murf_key)
     })
 
 
@@ -288,22 +321,11 @@ def generate_audio_guide():
             "audioNotice": None
         }), 500
 
-    encoded_audio = ""
-    audio_path, speech_notice = generate_speech(text_description, voice_id, locale)
-
-    if audio_path and os.path.exists(audio_path):
-        try:
-            with open(audio_path, "rb") as f:
-                encoded_audio = base64.b64encode(f.read()).decode("utf-8")
-        finally:
-            try:
-                os.unlink(audio_path)
-            except Exception:
-                pass
+    encoded_audio, speech_notice = generate_speech(text_description, voice_id, locale)
 
     return jsonify({
         "description": text_description,
-        "audioBase64": encoded_audio,
+        "audioBase64": encoded_audio or "",
         "audioNotice": speech_notice if not encoded_audio else None
     })
 
