@@ -132,6 +132,18 @@ def generate_speech(text, voice_id, locale):
         return None, str(e)
 
 
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({
+        "status": "online",
+        "message": "Travel Guide Backend is running successfully!",
+        "endpoints": {
+            "/health": "GET - Server health check",
+            "/generate-audio-guide": "POST - Generate travel guide & audio"
+        }
+    })
+
+
 @app.route("/health", methods=["GET"])
 def health_check():
     return jsonify({

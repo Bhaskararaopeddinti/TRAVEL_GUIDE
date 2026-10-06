@@ -207,7 +207,15 @@ voiceButtons.forEach(btn => {
 });
 
 // Generate Audio guide button Logic
-const GENERATE_AUDIO_GUIDE_API_URL = "http://127.0.0.1:5000/generate-audio-guide";
+const RENDER_BACKEND_URL = "https://travel-guide-backend-0hlq.onrender.com";
+const LOCAL_BACKEND_URL = "http://127.0.0.1:5000";
+
+// Use local backend if running locally on port 5000/localhost, otherwise use the live Render backend
+const BACKEND_BASE = (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1")
+  ? LOCAL_BACKEND_URL
+  : RENDER_BACKEND_URL;
+
+const GENERATE_AUDIO_GUIDE_API_URL = `${BACKEND_BASE}/generate-audio-guide`;
 
 generateButton.addEventListener('click', async () => {
   if (!state.place) {
