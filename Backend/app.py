@@ -1,6 +1,8 @@
 import os
+import time
 import tempfile
 import base64
+import re
 from pathlib import Path
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -20,7 +22,49 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite").strip()
 PORT = int(os.getenv("PORT", 5000))
 
 app = Flask(__name__)
-CORS(app)
+
+# Allowed origins for CORS (Production Render Frontend + Localhost environments)
+ALLOWED_ORIGINS = [
+    "https://travel-guide-frontend-uswz.onrender.com",
+    "http://127.0.0.1:5000",
+    "http://localhost:5000",
+    "http://127.0.0.1:5500",
+    "http://localhost:5500",
+    "http://localhost:3000",
+    "http://localhost:8080",
+    "http://localhost",
+    "http://127.0.0.1",
+]
+
+render_origin_pattern = re.compile(r"^https:\/\/.*\.onrender\.com$")
+
+CORS(
+    app,
+    resources={
+        r"/*": {
+            "origins": ALLOWED_ORIGINS + [render_origin_pattern],
+            "methods": ["GET", "POST", "OPTIONS"],
+            "allow_headers": ["Content-Type", "Authorization"]
+        }
+    },
+    supports_credentials=True
+)
+
+@app.after_request
+def add_cors_headers(response):
+    """Ensure CORS headers are consistently applied, including on error responses."""
+    origin = request.headers.get("Origin")
+    if origin:
+        if (
+            origin in ALLOWED_ORIGINS
+            or origin.endswith(".onrender.com")
+            or "localhost" in origin
+            or "127.0.0.1" in origin
+        ):
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    return response
 
 # Initialize Gemini Client
 client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
@@ -60,6 +104,18 @@ Respond ONLY in {language}.
 """
 }
 
+class GeminiUnavailableError(Exception):
+    """Raised when Gemini upstream is unavailable or experiencing temporary high demand."""
+    pass
+
+
+def is_gemini_temporary_error(err):
+    err_str = str(err).lower()
+    return any(keyword in err_str for keyword in [
+        "503", "unavailable", "high demand", "resourceexhausted", "quota", "429", "deadline"
+    ])
+
+
 def generate_description(place, answer_type, language):
     if not client:
         raise ValueError("GEMINI_API_KEY is not configured. Please set it in your .env file.")
@@ -67,27 +123,54 @@ def generate_description(place, answer_type, language):
     prompt_template = PROMPTS.get(answer_type, PROMPTS["Summary"])
     prompt = prompt_template.format(place=place, language=language)
 
-    # Models to try with fallback in case of high demand
-    models_to_try = [GEMINI_MODEL, "gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-3.8-flash"]
+    # Models to try in order of fallback in case of high demand
+    models_to_try = [
+        GEMINI_MODEL,
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.0-flash",
+        "gemini-3.1-flash-lite",
+        "gemini-1.5-flash",
+    ]
     seen = set()
     candidate_models = [m for m in models_to_try if m and not (m in seen or seen.add(m))]
 
     last_error = None
+    all_temporary_errors = True
+
     for model_name in candidate_models:
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt
-            )
-            if response and response.text:
-                return response.text.strip()
-        except Exception as e:
-            last_error = e
-            print(f"[Gemini] Model '{model_name}' attempt failed: {e}. Trying fallback if available...")
-            continue
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt
+                )
+                if response and response.text:
+                    return response.text.strip()
+            except Exception as e:
+                last_error = e
+                temp_error = is_gemini_temporary_error(e)
+                if not temp_error:
+                    all_temporary_errors = False
+
+                print(f"[Gemini] Model '{model_name}' attempt {attempt + 1}/{max_retries} failed: {e}")
+
+                if temp_error and attempt < max_retries - 1:
+                    sleep_time = 1.0 * (attempt + 1)
+                    print(f"[Gemini] High demand / 503 detected. Retrying in {sleep_time}s...")
+                    time.sleep(sleep_time)
+                else:
+                    # Move to next fallback model
+                    break
 
     if last_error:
+        if all_temporary_errors or is_gemini_temporary_error(last_error):
+            raise GeminiUnavailableError(
+                "Gemini is temporarily experiencing high demand. Please try again."
+            )
         raise last_error
+
     raise RuntimeError("Failed to generate description from Gemini.")
 
 
@@ -149,8 +232,10 @@ def favicon():
     return ("", 204)
 
 
-@app.route("/health", methods=["GET"])
+@app.route("/health", methods=["GET", "OPTIONS"])
 def health_check():
+    if request.method == "OPTIONS":
+        return ("", 204)
     return jsonify({
         "status": "ok",
         "gemini_configured": bool(GEMINI_API_KEY),
@@ -158,23 +243,50 @@ def health_check():
     })
 
 
-@app.route("/generate-audio-guide", methods=["POST"])
+@app.route("/generate-audio-guide", methods=["POST", "OPTIONS"])
 def generate_audio_guide():
-    data = request.get_json(silent=True) or {}
-    place = data.get("place", "").strip()
-    answer_type = data.get("answerType", "Summary")
-    language = data.get("language", "English")
-    voice_id = data.get("voiceId", "Matthew")
-    locale = data.get("locale", "en-US")
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Invalid JSON body provided."}), 400
+
+    place = str(data.get("place", "")).strip()
+    answer_type = str(data.get("answerType", "")).strip() or "Summary"
+    language = str(data.get("language", "")).strip() or "English"
+    voice_id = str(data.get("voiceId", "")).strip() or "Matthew"
+    locale = str(data.get("locale", "")).strip() or "en-US"
 
     if not place:
         return jsonify({"error": "Destination place name is required."}), 400
 
     try:
         text_description = generate_description(place, answer_type, language)
+    except GeminiUnavailableError as e:
+        print(f"[Gemini 503] {e}")
+        return jsonify({
+            "error": "Gemini is temporarily experiencing high demand. Please try again.",
+            "description": "",
+            "audioBase64": "",
+            "audioNotice": "Gemini is temporarily unavailable due to high demand. Please try again in a few moments."
+        }), 503
+    except ValueError as e:
+        print(f"[Config Error] {e}")
+        return jsonify({
+            "error": str(e),
+            "description": "",
+            "audioBase64": "",
+            "audioNotice": str(e)
+        }), 500
     except Exception as e:
         print(f"[Error] Failed to generate description: {e}")
-        return jsonify({"error": f"Failed to generate description: {str(e)}"}), 500
+        return jsonify({
+            "error": "Failed to generate description. Please try again.",
+            "description": "",
+            "audioBase64": "",
+            "audioNotice": None
+        }), 500
 
     encoded_audio = ""
     audio_path, speech_notice = generate_speech(text_description, voice_id, locale)
@@ -194,6 +306,37 @@ def generate_audio_guide():
         "audioBase64": encoded_audio,
         "audioNotice": speech_notice if not encoded_audio else None
     })
+
+
+@app.errorhandler(400)
+def handle_bad_request(e):
+    return jsonify({"error": getattr(e, "description", "Bad Request")}), 400
+
+
+@app.errorhandler(404)
+def handle_not_found(e):
+    return jsonify({"error": "Endpoint not found"}), 404
+
+
+@app.errorhandler(500)
+def handle_server_error(e):
+    return jsonify({"error": "An internal server error occurred. Please try again."}), 500
+
+
+@app.errorhandler(503)
+def handle_service_unavailable(e):
+    return jsonify({
+        "error": "Gemini is temporarily unavailable. Please try again.",
+        "description": "",
+        "audioBase64": "",
+        "audioNotice": "Gemini is temporarily unavailable due to high demand. Please try again in a few moments."
+    }), 503
+
+
+@app.errorhandler(Exception)
+def handle_general_exception(e):
+    print(f"[Unhandled Exception] {e}")
+    return jsonify({"error": "An unexpected server error occurred. Please try again."}), 500
 
 
 if __name__ == "__main__":
