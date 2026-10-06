@@ -73,6 +73,10 @@ function selectDestination(place, image, clickedCard = null) {
   audioSection.classList.add('hidden');
   audioPlayer.src = '';
   transcriptText.textContent = '';
+  const oldNotice = document.getElementById('audioNoticeBanner');
+  if (oldNotice) oldNotice.remove();
+  const oldFallbackBtn = document.getElementById('browserSpeechBtn');
+  if (oldFallbackBtn) oldFallbackBtn.remove();
   generateButton.textContent = 'Generate Audio Guide';
   generateButton.disabled = false;
 
@@ -206,16 +210,15 @@ voiceButtons.forEach(btn => {
   });
 });
 
-// Generate Audio guide button Logic
-const RENDER_BACKEND_URL = "https://travel-guide-backend-0hlq.onrender.com";
+// Backend connection configuration
 const LOCAL_BACKEND_URL = "http://127.0.0.1:5000";
+const RENDER_BACKEND_URL = "https://travel-guide-backend-0hlq.onrender.com";
 
-// Use local backend if running locally on port 5000/localhost, otherwise use the live Render backend
-const BACKEND_BASE = (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1")
-  ? LOCAL_BACKEND_URL
-  : RENDER_BACKEND_URL;
-
-const GENERATE_AUDIO_GUIDE_API_URL = `${BACKEND_BASE}/generate-audio-guide`;
+const backendUrl =
+  window.location.hostname === "localhost" ||
+  window.location.hostname === "127.0.0.1"
+    ? LOCAL_BACKEND_URL
+    : RENDER_BACKEND_URL;
 
 generateButton.addEventListener('click', async () => {
   if (!state.place) {
@@ -230,7 +233,7 @@ generateButton.addEventListener('click', async () => {
     const selectedLanguage = languageSelect.value;
     const selectedVoice = state.voice;
 
-    const response = await fetch(GENERATE_AUDIO_GUIDE_API_URL, {
+    const response = await fetch(`${backendUrl}/generate-audio-guide`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -249,18 +252,34 @@ generateButton.addEventListener('click', async () => {
 
     const data = await response.json();
 
-    // Update UI with Result
-    transcriptText.textContent = data.description;
+    // 1. Display Gemini-generated description
+    transcriptText.textContent = data.description || '';
     audioSection.classList.remove('hidden');
 
     // Automatically expand transcript
     transcriptContent.classList.remove('hidden');
     transcriptArrow.classList.add('rotate-180');
 
-    // Remove any previous fallback button
+    // 2. Display backend audio notice if present
+    let noticeEl = document.getElementById('audioNoticeBanner');
+    if (data.audioNotice) {
+      if (!noticeEl) {
+        noticeEl = document.createElement('div');
+        noticeEl.id = 'audioNoticeBanner';
+        audioSection.insertBefore(noticeEl, audioSection.firstChild);
+      }
+      noticeEl.className = 'mb-4 p-3.5 text-xs rounded-xl bg-amber-50 border border-amber-200 text-amber-800 flex items-start gap-2 leading-relaxed';
+      noticeEl.innerHTML = `<span class="text-sm">ℹ️</span> <div><strong class="font-semibold block">Notice:</strong>${data.audioNotice}</div>`;
+      noticeEl.classList.remove('hidden');
+    } else if (noticeEl) {
+      noticeEl.remove();
+    }
+
+    // Remove any previous browser fallback button
     const oldFallbackBtn = document.getElementById('browserSpeechBtn');
     if (oldFallbackBtn) oldFallbackBtn.remove();
 
+    // 3. Display Murf Audio and Audio player
     if (data.audioBase64) {
       audioPlayer.src = `data:audio/mp3;base64,${data.audioBase64}`;
       audioPlayer.load();
@@ -271,7 +290,7 @@ generateButton.addEventListener('click', async () => {
         generateButton.disabled = false;
       }, 2000);
     } else {
-      // Murf audio not available (e.g. masked key in .env)
+      // Murf audio not available (e.g. key missing/masked or notice returned)
       audioPlayer.classList.add('hidden');
       generateButton.textContent = 'Audio Guide Ready';
       generateButton.disabled = false;
