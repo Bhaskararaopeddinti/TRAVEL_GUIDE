@@ -212,7 +212,7 @@ voiceButtons.forEach(btn => {
 
 // Backend connection configuration
 const LOCAL_BACKEND_URL = "http://127.0.0.1:5000";
-const RENDER_BACKEND_URL = "https://travel-guide-backend-0hlq.onrender.com";
+const RENDER_BACKEND_URL = "https://travel-guide-cijv.onrender.com";
 
 const backendUrl =
   window.location.hostname === "localhost" ||
